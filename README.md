@@ -7,12 +7,22 @@ with bounding boxes. Trained and evaluated on the D-Fire dataset
 **Headline result:** 78.07% mAP@0.50 on the test set (4,306 images). The project target was 90%, so this run is
 11.93 points short. It is a single training run with one random seed.
 
-## Quick start (no training)
+## Which notebook should I open?
 
-Training the model takes several hours (about 4.7 hours here), but you do not need to repeat it. The trained model is in the repo.
-Open **`forest_fire_inference.ipynb`** (locally, on Kaggle or on Colab): it downloads the model, shows the saved results and
-runs the detector on example images or on your own, in about a minute. To run it on a single image from the command line
-use `predict.py` (see "Using the trained model" below). `forest_fire_vit_detection.ipynb` is the full training pipeline.
+The repo has two notebooks. Most people only need the first one.
+
+| | `forest_fire_inference.ipynb` | `forest_fire_vit_detection.ipynb` |
+|---|---|---|
+| **What it is** | Quick start: loads the **already-trained model** and uses it | The **full pipeline**: data cleaning, model selection, training, evaluation, error analysis |
+| **Trains a model?** | **No** | **Yes** (model selection, then 12 epochs of final training) |
+| **Run time** | About 1 minute (plus a one-time 424 MB model download if the model is not already present) | Several hours (about 4.7 hours on the machine it was run on; slower GPUs take longer) |
+| **Needs the dataset?** | No (only for the optional example test images and the optional confusion-matrix rerun) | Yes, the D-Fire dataset (about 3 GB) and a GPU |
+| **What you get** | The saved results (78.07% mAP@0.50), plots and confusion matrix, and detections on example or your own images | Reproduces the whole experiment from scratch, and a new trained model |
+| **Open it if** | You want to try or use the model, or check the results | You want to see how the model was built, or retrain or change it |
+
+In short: **to use the model, open `forest_fire_inference.ipynb`. To reproduce or change the training, open
+`forest_fire_vit_detection.ipynb`.** Both work on your own computer, Kaggle or Colab. To run the model on a single
+image from the command line instead, use `predict.py` (see "Using the trained model" below).
 
 ## Results
 
