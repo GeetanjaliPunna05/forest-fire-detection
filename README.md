@@ -35,7 +35,7 @@ boxes (34.2%) got no detection, against 16.3% of smoke.
 Validation mAP@0.50 rose from 56.6 (epoch 1) to about 79 by epoch 8 and then stayed flat while the training loss
 kept falling, so more epochs of the same setup would add little.
 
-### Where it fails
+### Error analysis
 
 - Fire recall is 52.5% on small objects against 80.6% on large ones (smoke: 67.6% small, 90.5% large).
 - 478 fire and 266 smoke detections had the right class but IoU only 0.1-0.5 (poor localisation).
