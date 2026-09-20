@@ -1,0 +1,1168 @@
+==============================================================================
+FOREST FIRE AND SMOKE DETECTION WITH A VISION-TRANSFORMER (ViTDet-STYLE FASTER R-CNN)
+End-to-end code, explanation and results
+==============================================================================
+
+WHAT THIS FILE IS
+  The complete pipeline from the notebook forest_fire_vit_detection.ipynb, in
+  order: setup, data cleaning, model, training, model selection, evaluation,
+  error analysis, model saving and inference. Explanations appear as '#' comment
+  blocks; everything else is runnable Python. Copy the code sections, in order,
+  into one notebook or script.
+
+TASK
+  Detect smoke (class 0) and fire (class 1) in images with bounding boxes.
+
+DATA
+  D-Fire dataset, YOLO format (Kaggle: sayedgamal99/smoke-fire-detection-yolo).
+  train 14,122 | val 3,099 | test 4,306 images. About 45% of images are empty
+  (no fire or smoke) and are kept as negative examples.
+
+HOW TO RUN
+  1. Python environment with: torch, torchvision, timm>=1.0, albumentations,
+     pycocotools, opencv-python, pandas, numpy, matplotlib, tqdm.
+  2. Set the environment variable DATA_ROOT to the folder that contains
+     train/, val/ and test/ (each with images/ and labels/).
+  3. Run all sections in order. A GPU is needed in practice.
+  Windows note: set NUM_WORKERS = 0 (already done in the configuration section),
+  because a notebook-defined Dataset cannot be pickled to spawned workers.
+
+HARDWARE AND TIME OF THE RUN REPORTED BELOW
+  AMD Radeon RX 9070 GRE (ROCm build of PyTorch 2.9.1), mixed precision.
+  Model selection about 78 minutes; final training 200 minutes (12 epochs).
+
+RESULTS (test set, 4,306 images, confidence 0.82, NMS IoU 0.5, match IoU 0.5)
+  Class    Precision  Recall   F1     AP@50   AP@50:95
+  Smoke    82.35      83.56    82.95  85.33   48.12
+  Fire     73.04      65.43    69.02  70.81   34.32
+  Overall  77.69      74.49    75.99  78.07   41.22
+  Validation mAP@0.50 of the selected checkpoint: 79.15
+  The notebook's own target was 90% mAP@0.50; the result is 11.93 points below it.
+
+MODEL SELECTION (short runs on a 2,000-image subset, 3 epochs, validation mAP@50)
+  ViT-B, 640x384                      49.61   <- selected
+  ViT-S, 640x384                      45.07
+  ViT-S, 832x480                      43.05
+  ViT-S, 640x384, no stride-4 level   38.82
+  ViT-S, 640x384, first 6 blocks frozen 38.62
+  Recipe variants on ViT-B: lr 2e-4 = 50.68 (selected), baseline lr 1e-4 = 49.61,
+  all negatives every epoch = 49.41.
+
+ERROR ANALYSIS (test, at confidence 0.82)
+  False positives  fire: background 192, duplicate 20, poor localisation 478, wrong class 5
+                   smoke: background 127, duplicate 6, poor localisation 266, wrong class 15
+  Missed boxes     fire: missed 983, class confusion 12 | smoke: missed 375, class confusion 5
+  Recall by object size  fire: small 52.5, medium 77.5, large 80.6
+                         smoke: small 67.6, medium 75.7, large 90.5
+  Empty test images with at least one false alarm: 27 of 2,005 (1.3%)
+
+==============================================================================
+CODE, IN ORDER
+==============================================================================
+
+
+# ----------------------------------------------------------------------------
+# # Forest Fire Detection Using Vision Transformer
+#
+# **Task.** Detect **smoke** and **fire** in images with bounding boxes (object detection, not classification).
+#
+# **Dataset.** `sayedgamal99/smoke-fire-detection-yolo` (D-Fire, YOLO format) - classes `0 = smoke`, `1 = fire`.
+#
+# **Model.** A *ViTDet-style Faster R-CNN*:
+# - **Backbone:** a plain Vision Transformer (ViT, pretrained on ImageNet-21k/1k via `timm`), fine-tuned end-to-end.
+# - **Neck:** ViTDet's *Simple Feature Pyramid* - multi-scale maps (strides 4/8/16/32/64) built from the single stride-16 ViT feature map.
+# - **Head:** Faster R-CNN (RPN + RoIAlign + box head) from `torchvision`, with anchors sized from the dataset's box statistics.
+#
+# Why this architecture: it is a genuine ViT detector (ViTDet, Li et al. 2022) that has pretrained ViT weights available, runs with mixed precision on a 16 GB T4, and keeps a multi-scale pyramid, which matters because **fire boxes are small** (median about 0.5% of the image area) while smoke boxes are large.
+#
+# **Metrics (all standard detection metrics, computed on boxes):**
+# - **AP@0.50 / mAP@0.50 / mAP@0.50:0.95** - COCO-style average precision (`pycocotools`, 101-point interpolation).
+# - **Precision / Recall / F1** - at IoU >= 0.5, at a single confidence threshold chosen *on the validation set* (the threshold maximising the mean per-class F1) and then applied unchanged to the test set. Overall P/R/F1 are the macro-average over the two classes.
+# - "Accuracy" is not a detection metric and is not reported. The headline number for the 90% target is **mAP@0.50**.
+#
+# Nothing in this notebook is hard-coded: every number shown is computed when it runs. Runs on Kaggle or Google Colab with a **GPU (T4)** and Internet (to download the pretrained ViT weights). On Colab, mount Google Drive (`from google.colab import drive; drive.mount('/content/drive')`) before running so checkpoints survive disconnects.
+# ----------------------------------------------------------------------------
+
+
+# ----------------------------------------------------------------------------
+# ## 1. Setup
+# ----------------------------------------------------------------------------
+
+# [code block 1]
+import os, sys, gc, io, json, math, time, random, copy, contextlib, subprocess, warnings
+from pathlib import Path
+from collections import OrderedDict, defaultdict
+
+IN_KAGGLE = Path("/kaggle/working").exists()
+IN_COLAB = Path("/content").exists() and not IN_KAGGLE
+if IN_KAGGLE or IN_COLAB:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "timm>=1.0", "pycocotools", "albumentations"], check=False)
+
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Sampler
+import torchvision
+from torchvision.models.detection import FasterRCNN
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.ops import MultiScaleRoIAlign, box_iou
+import timm
+import albumentations as A
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from tqdm.auto import tqdm
+
+warnings.filterwarnings("ignore")
+cv2.setNumThreads(0)
+plt.rcParams.update({"figure.dpi": 110, "axes.grid": False})
+
+
+def seed_everything(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = DEVICE.type == "cuda"
+if USE_AMP:
+    torch.backends.cudnn.benchmark = True
+print(f"torch {torch.__version__} | torchvision {torchvision.__version__} | timm {timm.__version__} | albumentations {A.__version__}")
+print("device:", torch.cuda.get_device_name(0) if USE_AMP else "CPU (training will be very slow)")
+
+
+# ----------------------------------------------------------------------------
+# ## 2. Configuration
+# ----------------------------------------------------------------------------
+
+# [code block 2]
+QUICK_RUN = False          # True: tiny end-to-end dry run (~10 min on a T4) to check the whole pipeline
+SEED = 42
+if IN_KAGGLE:
+    OUT_DIR = Path("/kaggle/working")
+elif IN_COLAB and Path("/content/drive/MyDrive").exists():
+    OUT_DIR = Path("/content/drive/MyDrive/forest_fire_outputs")   # Google Drive: survives Colab disconnects
+else:
+    OUT_DIR = Path("outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+CKPT_PATH = OUT_DIR / "forest_fire_detection_best.pth"
+LAST_PATH = OUT_DIR / "last_checkpoint.pth"        # resumable state (Kaggle sessions can time out)
+
+CLASS_NAMES = {1: "smoke", 2: "fire"}              # model labels (0 is background); dataset ids are 0/1
+COLORS = {1: "#00a2ff", 2: "#ff3b1f"}
+NUM_WORKERS = 0 if sys.platform == "win32" else min(4, os.cpu_count() or 1)   # notebook-defined Dataset cannot be pickled to spawned workers on Windows
+BATCH_SIZE, EVAL_BATCH_SIZE = 8, 16
+TARGET_MAP50 = 90.0
+
+if QUICK_RUN:
+    RUN = dict(sel_train=64, sel_val=32, sel_epochs=1, final_epochs=2, patience=2, train_limit=160, val_limit=48, test_limit=48)
+else:
+    RUN = dict(sel_train=2000, sel_val=500, sel_epochs=3, final_epochs=12, patience=4, train_limit=None, val_limit=None, test_limit=None)
+MAX_HOURS = 7.0            # safety stop for the final training run (best checkpoint is kept)
+
+# Baseline model/training configuration. Candidates below override individual entries.
+BASE_CFG = dict(
+    vit="vit_small_patch16_224.augreg_in21k_ft_in1k",   # pretrained plain ViT (patch 16)
+    canvas=(384, 640),          # (H, W) network input; images are letterboxed (aspect kept), most are 16:9
+    strides=(4, 8, 16, 32),     # pyramid levels (+ one extra pooled level at 2x the last stride for the RPN)
+    lr=1e-4, layer_decay=0.8, weight_decay=0.05, drop_path=0.1,
+    freeze_blocks=0,            # number of leading ViT blocks (and the patch embedding) kept frozen
+    neg_frac=0.5,               # fraction of empty (negative) images used per epoch, resampled every epoch
+    warmup_iters=300, ema_decay=0.999,
+)
+
+# Stage A: architecture / resolution / fine-tuning strategy (short runs on a subset).
+ARCH_CANDIDATES = {
+    "ViT-S | 640x384": {},
+    "ViT-S | 640x384 | no stride-4 level": dict(strides=(8, 16, 32)),
+    "ViT-S | 832x480": dict(canvas=(480, 832)),
+    "ViT-B | 640x384": dict(vit="vit_base_patch16_224.augreg_in21k_ft_in1k"),
+    "ViT-S | 640x384 | first 6 blocks frozen": dict(freeze_blocks=6),
+}
+# Stage B: training-recipe variants applied to the Stage-A winner.
+RECIPE_VARIANTS = {
+    "lr 2e-4": dict(lr=2e-4),
+    "all negatives every epoch": dict(neg_frac=1.0),
+}
+seed_everything(SEED)
+
+
+# ----------------------------------------------------------------------------
+# ## 3. Dataset
+# ### 3.1 Locate the data, parse the YOLO labels, validate and clean them
+#
+# YOLO line: `class cx cy w h` (normalised). Each label is converted to absolute pixel `x1 y1 x2 y2` at the original image resolution.
+# Cleaning rules: out-of-range coordinates are clipped to the image, degenerate boxes (< 2 px on a side) and exact duplicates are dropped, unknown class ids / malformed lines are dropped.
+# **Empty label files are kept**: they are images without fire or smoke (verified visually below) and act as negative examples.
+# ----------------------------------------------------------------------------
+
+# [code block 3]
+def find_dataset_root():
+    cands = []
+    if os.environ.get("DATA_ROOT"):
+        cands.append(Path(os.environ["DATA_ROOT"]))
+    cands += [Path("/kaggle/input/datasets/sayedgamal99/smoke-fire-detection-yolo"),
+              Path("/kaggle/input/smoke-fire-detection-yolo")]
+    for base in cands:
+        for p in (base, base / "data"):
+            if (p / "train" / "images").is_dir():
+                return p
+    for root in ("/kaggle/input", "/content", "/content/drive/MyDrive"):     # bounded-depth search
+        base_depth = root.rstrip("/").count("/")
+        for cur, dirs, _ in os.walk(root):
+            dirs[:] = [d for d in dirs if cur.count("/") - base_depth < 5 and d not in ("sample_data", "drive", ".config")]
+            if os.path.isdir(os.path.join(cur, "train", "images")):
+                return Path(cur)
+    raise FileNotFoundError("Dataset not found. On Kaggle attach 'sayedgamal99/smoke-fire-detection-yolo'; on Colab put the "
+                            "unzipped folder (containing train/val/test) under /content or Google Drive, or set DATA_ROOT.")
+
+
+DATA_ROOT = find_dataset_root()
+IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp"}
+CLEAN_STATS = defaultdict(int)
+
+
+def parse_labels(label_path, w, h):
+    boxes, labels, seen = [], [], set()
+    if not label_path.exists():
+        CLEAN_STATS["missing_label_file"] += 1
+        return np.zeros((0, 4), np.float32), np.zeros((0,), np.int64)
+    for line in label_path.read_text().splitlines():
+        p = line.split()
+        if not p:
+            continue
+        try:
+            assert len(p) == 5
+            c = int(float(p[0])); cx, cy, bw, bh = map(float, p[1:])
+        except (AssertionError, ValueError):
+            CLEAN_STATS["malformed_line"] += 1; continue
+        if c not in (0, 1):
+            CLEAN_STATS["unknown_class"] += 1; continue
+        x1, y1, x2, y2 = (cx - bw / 2) * w, (cy - bh / 2) * h, (cx + bw / 2) * w, (cy + bh / 2) * h
+        cx1, cy1, cx2, cy2 = max(0.0, x1), max(0.0, y1), min(float(w), x2), min(float(h), y2)
+        if max(cx1 - x1, cy1 - y1, x2 - cx2, y2 - cy2) > 1.0:
+            CLEAN_STATS["clipped_to_image"] += 1
+        if cx2 - cx1 < 2 or cy2 - cy1 < 2:
+            CLEAN_STATS["degenerate_box_removed"] += 1; continue
+        key = (c, round(cx1, 1), round(cy1, 1), round(cx2, 1), round(cy2, 1))
+        if key in seen:
+            CLEAN_STATS["duplicate_box_removed"] += 1; continue
+        seen.add(key)
+        boxes.append([cx1, cy1, cx2, cy2]); labels.append(c + 1)
+    return np.array(boxes, np.float32).reshape(-1, 4), np.array(labels, np.int64)
+
+
+def load_split(split):
+    img_dir, lab_dir = DATA_ROOT / split / "images", DATA_ROOT / split / "labels"
+    records = []
+    for p in tqdm(sorted(q for q in img_dir.iterdir() if q.suffix.lower() in IMG_EXT), desc=f"parse {split}", leave=False):
+        with Image.open(p) as im:
+            w, h = im.size
+        boxes, labels = parse_labels(lab_dir / (p.stem + ".txt"), w, h)
+        records.append(dict(name=p.name, img=str(p), w=w, h=h, boxes=boxes, labels=labels))
+    return records
+
+
+SPLITS = {s: load_split(s) for s in ("train", "val", "test")}
+print("dataset root:", DATA_ROOT)
+print("label cleaning:", dict(CLEAN_STATS) or "nothing to fix")
+
+
+# ----------------------------------------------------------------------------
+# ### 3.2 Dataset inspection
+# ----------------------------------------------------------------------------
+
+# [code block 4]
+def rel_areas(records):
+    return np.array([(b[2] - b[0]) * (b[3] - b[1]) / (r["w"] * r["h"]) for r in records for b in r["boxes"]])
+
+
+summary = []
+for s, recs in SPLITS.items():
+    lab = np.concatenate([r["labels"] for r in recs])
+    summary.append(dict(split=s, images=len(recs), with_objects=sum(len(r["labels"]) > 0 for r in recs),
+                        empty=sum(len(r["labels"]) == 0 for r in recs), boxes=len(lab),
+                        smoke_boxes=int((lab == 1).sum()), fire_boxes=int((lab == 2).sum())))
+summary = pd.DataFrame(summary).set_index("split")
+summary["empty_%"] = (100 * summary["empty"] / summary["images"]).round(1)
+display(summary)
+
+names = {s: {r["name"] for r in recs} for s, recs in SPLITS.items()}
+print("file-name overlap  train/val: %d | train/test: %d | val/test: %d" % (
+    len(names["train"] & names["val"]), len(names["train"] & names["test"]), len(names["val"] & names["test"])))
+res = pd.Series([f"{r['w']}x{r['h']}" for r in SPLITS["train"]]).value_counts().head(5)
+print("most common train resolutions:", dict(res))
+
+train_rel = rel_areas(SPLITS["train"])
+SIZE_EDGES = np.quantile(train_rel, [1 / 3, 2 / 3])       # data-driven small / medium / large split (relative box area)
+print("size buckets (box area / image area): small < %.2f%% <= medium < %.2f%% <= large" % (100 * SIZE_EDGES[0], 100 * SIZE_EDGES[1]))
+
+fig, ax = plt.subplots(1, 4, figsize=(17, 3.4))
+for k, (c, n) in enumerate(CLASS_NAMES.items()):
+    ra = np.array([(b[2] - b[0]) * (b[3] - b[1]) / (r["w"] * r["h"]) for r in SPLITS["train"] for b, l in zip(r["boxes"], r["labels"]) if l == c])
+    ax[0].hist(np.log10(ra), bins=40, alpha=.65, color=COLORS[c], label=f"{n} (median {100 * np.median(ra):.2f}%)")
+ax[0].set_xlabel("log10(box area / image area)"); ax[0].legend(fontsize=8); ax[0].set_title("Box size by class")
+ar = np.array([(b[3] - b[1]) / (b[2] - b[0]) for r in SPLITS["train"] for b in r["boxes"]])
+ax[1].hist(np.log2(ar), bins=40, color="#666"); ax[1].set_xlabel("log2(height / width)"); ax[1].set_title("Box aspect ratio")
+ax[2].hist([len(r["labels"]) for r in SPLITS["train"]], bins=range(0, 12), color="#666"); ax[2].set_xlabel("boxes per image"); ax[2].set_title("Objects per image")
+summary[["smoke_boxes", "fire_boxes"]].plot.bar(ax=ax[3], color=[COLORS[1], COLORS[2]], rot=0); ax[3].set_title("Boxes per split")
+plt.tight_layout(); plt.savefig(OUT_DIR / "dataset_statistics.png", bbox_inches="tight"); plt.show()
+
+
+# ----------------------------------------------------------------------------
+# ### 3.3 Visualisation helpers and a visual check of ground truth
+# Below: random annotated images, and random images with an **empty label file** - these show no fire or smoke, confirming they are valid negatives rather than missing annotations.
+# ----------------------------------------------------------------------------
+
+# [code block 5]
+def read_rgb(path):
+    return cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+
+
+def draw_boxes(ax, boxes, labels, scores=None, dashed=False, lw=2.0):
+    for k, (b, l) in enumerate(zip(boxes, labels)):
+        ax.add_patch(patches.Rectangle((b[0], b[1]), b[2] - b[0], b[3] - b[1], fill=False, lw=lw,
+                                       ls="--" if dashed else "-", ec="white" if dashed else COLORS[int(l)]))
+        if scores is not None:
+            ax.text(b[0], max(b[1] - 3, 0), f"{CLASS_NAMES[int(l)]} {scores[k]:.2f}", fontsize=8, color="white", va="bottom",
+                    bbox=dict(fc=COLORS[int(l)], ec="none", pad=1.2, alpha=.9))
+        elif not dashed:
+            ax.text(b[0], max(b[1] - 3, 0), CLASS_NAMES[int(l)], fontsize=8, color="white", va="bottom",
+                    bbox=dict(fc=COLORS[int(l)], ec="none", pad=1.2, alpha=.9))
+
+
+def show_grid(panels, ncols=4, title=None, save=None, size=3.6):
+    """panels: list of (image, [(boxes, labels, scores, dashed), ...], title)"""
+    nrows = max(1, math.ceil(len(panels) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(size * ncols, size * 0.75 * nrows), squeeze=False)
+    for a in axes.ravel():
+        a.axis("off")
+    for a, (img, layers, ttl) in zip(axes.ravel(), panels):
+        a.imshow(img)
+        for boxes, labels, scores, dashed in layers:
+            draw_boxes(a, boxes, labels, scores, dashed)
+        a.set_title(ttl, fontsize=8)
+    if title:
+        fig.suptitle(title, fontsize=12)
+    plt.tight_layout()
+    if save:
+        plt.savefig(OUT_DIR / save, bbox_inches="tight")
+    plt.show()
+
+
+rng = np.random.RandomState(SEED)
+pos_idx = rng.choice([i for i, r in enumerate(SPLITS["train"]) if len(r["labels"])], 8, replace=False)
+neg_idx = rng.choice([i for i, r in enumerate(SPLITS["train"]) if not len(r["labels"])], 8, replace=False)
+show_grid([(read_rgb(SPLITS["train"][i]["img"]), [(SPLITS["train"][i]["boxes"], SPLITS["train"][i]["labels"], None, False)], SPLITS["train"][i]["name"]) for i in pos_idx],
+          title="Training images with ground-truth boxes", save="samples_ground_truth.png")
+show_grid([(read_rgb(SPLITS["train"][i]["img"]), [], SPLITS["train"][i]["name"] + "  (empty label)") for i in neg_idx],
+          title="Images with empty label files (negatives)", save="samples_negatives.png")
+
+
+# ----------------------------------------------------------------------------
+# ### 3.4 Datasets, preprocessing, augmentation, DataLoaders
+#
+# - **Preprocessing:** letterbox to the network canvas (aspect ratio preserved, grey padding at the bottom/right), so predicted boxes map back to the original image by a single division by the scale.
+# - **Augmentation (training only):** horizontal flip, random scale/translate, brightness/contrast, mild hue/saturation, blur and noise. Vertical flips and strong colour shifts are avoided because the fire/smoke appearance is colour dependent.
+# - **Negatives:** empty images stay in the training set. Each epoch uses all positive images plus a freshly re-sampled fraction (`neg_frac`) of the negatives.
+# ----------------------------------------------------------------------------
+
+# [code block 6]
+def letterbox(img, boxes, canvas_hw):
+    H, W = canvas_hw
+    h, w = img.shape[:2]
+    s = min(H / h, W / w)
+    nh, nw = min(H, int(round(h * s))), min(W, int(round(w * s)))
+    img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+    out = np.full((H, W, 3), 114, np.uint8)
+    out[:nh, :nw] = img
+    boxes = boxes * s
+    boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, nw)
+    boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, nh)
+    return out, boxes, s
+
+
+def build_augmentation():
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.Affine(scale=(0.7, 1.3), translate_percent=(-0.1, 0.1), p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=0.6),
+        A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=25, val_shift_limit=20, p=0.4),
+        A.OneOf([A.GaussianBlur(blur_limit=(3, 5)), A.MotionBlur(blur_limit=5)], p=0.2),
+        A.GaussNoise(p=0.15),
+    ], bbox_params=A.BboxParams(format="pascal_voc", label_fields=["labels"], min_visibility=0.3, min_area=4.0))
+
+
+class FireDataset(Dataset):
+    def __init__(self, records, canvas_hw, train):
+        self.records, self.canvas, self.train = records, canvas_hw, train
+        self.aug = build_augmentation() if train else None
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, i):
+        r = self.records[i]
+        img, boxes, scale = letterbox(read_rgb(r["img"]), r["boxes"].copy(), self.canvas)
+        labels = r["labels"].copy()
+        if self.train:
+            out = self.aug(image=img, bboxes=boxes.tolist(), labels=labels.tolist())
+            img = out["image"]
+            boxes = np.array(out["bboxes"], np.float32).reshape(-1, 4)
+            labels = np.array(out["labels"], np.int64)
+        tensor = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1).float().div_(255)
+        target = dict(boxes=torch.from_numpy(boxes).float(), labels=torch.from_numpy(labels).long())
+        return tensor, target, dict(index=i, scale=scale, size=(r["w"], r["h"]))
+
+
+def collate(batch):
+    return tuple(zip(*batch))
+
+
+class EpochSampler(Sampler):
+    """All positive images + a re-sampled fraction of the negative images every epoch."""
+
+    def __init__(self, pos, neg, neg_frac, seed):
+        self.pos, self.neg, self.neg_frac, self.seed, self.epoch = np.array(pos), np.array(neg), neg_frac, seed, 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return len(self.pos) + int(round(len(self.neg) * self.neg_frac))
+
+    def __iter__(self):
+        rng = np.random.RandomState(self.seed + self.epoch)
+        neg = rng.permutation(self.neg)[: int(round(len(self.neg) * self.neg_frac))] if len(self.neg) else self.neg
+        idx = np.concatenate([self.pos, neg]).astype(int)
+        rng.shuffle(idx)
+        return iter(idx.tolist())
+
+
+def make_eval_loader(records, canvas_hw):
+    return DataLoader(FireDataset(records, canvas_hw, train=False), batch_size=EVAL_BATCH_SIZE, shuffle=False,
+                      num_workers=NUM_WORKERS, collate_fn=collate, pin_memory=USE_AMP)
+
+
+def subset(records, n, seed=SEED):
+    if n is None or n >= len(records):
+        return records
+    idx = np.random.RandomState(seed).choice(len(records), n, replace=False)
+    return [records[i] for i in sorted(idx)]
+
+
+TRAIN_RECS = subset(SPLITS["train"], RUN["train_limit"])
+VAL_RECS = subset(SPLITS["val"], RUN["val_limit"])
+TEST_RECS = subset(SPLITS["test"], RUN["test_limit"])
+print(f"train {len(TRAIN_RECS)} | val {len(VAL_RECS)} | test {len(TEST_RECS)} images")
+
+
+# ----------------------------------------------------------------------------
+# ## 4. Model
+#
+# ### 4.1 Anchor configuration from the data
+# Faster R-CNN is anchor based, so anchors should match the box distribution. Anchor sizes are `k x stride` at each pyramid level (several sizes and aspect ratios per location). Candidate settings are scored by how well the best anchor overlaps every training box (IoU of centred boxes). The setting with the best mean IoU under a budget of 6 anchors per location is used.
+# ----------------------------------------------------------------------------
+
+# [code block 7]
+def anchor_shapes(ks, ratios, strides):
+    return np.array([(k * s / math.sqrt(r), k * s * math.sqrt(r)) for s in strides for k in ks for r in ratios])
+
+
+def anchor_score(gt_wh, ks, ratios, strides):
+    a = anchor_shapes(ks, ratios, strides)
+    inter = np.minimum(gt_wh[:, None, 0], a[None, :, 0]) * np.minimum(gt_wh[:, None, 1], a[None, :, 1])
+    iou = (inter / (gt_wh[:, None, 0] * gt_wh[:, None, 1] + a[None, :, 0] * a[None, :, 1] - inter)).max(1)
+    return iou.mean(), (iou >= 0.5).mean(), (iou >= 0.7).mean()
+
+
+_H, _W = BASE_CFG["canvas"]
+gt_wh = np.array([[(b[2] - b[0]) * min(_H / r["h"], _W / r["w"]), (b[3] - b[1]) * min(_H / r["h"], _W / r["w"])]
+                  for r in SPLITS["train"] for b in r["boxes"]])
+LEVELS = list(BASE_CFG["strides"]) + [BASE_CFG["strides"][-1] * 2]
+rows = []
+for ks in [(4,), (2, 4), (3, 5), (4, 6), (2, 4, 6), (2, 3, 5)]:
+    for ratios in [(0.5, 1.0, 2.0), (0.33, 0.5, 1.0, 2.0), (0.25, 0.5, 1.0, 2.0, 4.0)]:
+        m, r5, r7 = anchor_score(gt_wh, ks, ratios, LEVELS)
+        rows.append(dict(sizes_x_stride=ks, aspect_ratios=ratios, anchors_per_location=len(ks) * len(ratios),
+                         mean_best_IoU=round(m, 3), box_recall_IoU50=round(r5, 3), box_recall_IoU70=round(r7, 3)))
+anchor_df = pd.DataFrame(rows)
+best_row = anchor_df[anchor_df.anchors_per_location <= 6].sort_values("mean_best_IoU", ascending=False).iloc[0]
+BASE_CFG["anchor_k"], BASE_CFG["anchor_ratios"] = tuple(best_row.sizes_x_stride), tuple(best_row.aspect_ratios)
+print(anchor_df[anchor_df.anchors_per_location <= 6].sort_values("mean_best_IoU", ascending=False).head(5).to_string(index=False))
+print("selected anchors -> sizes x stride:", BASE_CFG["anchor_k"], "| aspect ratios (h/w):", BASE_CFG["anchor_ratios"])
+
+
+# ----------------------------------------------------------------------------
+# ### 4.2 ViT backbone + Simple Feature Pyramid + Faster R-CNN
+# A plain ViT only produces one stride-16 feature map. Following ViTDet, the pyramid is created from that single map with (de)convolutions / pooling (strides 4, 8, 16, 32) plus one extra pooled level for the RPN. Global self-attention is kept in every block (the token count is small at this resolution). Layer-wise learning-rate decay, drop-path and EMA weights are used for stable fine-tuning of the pretrained transformer.
+# ----------------------------------------------------------------------------
+
+# [code block 8]
+class LayerNorm2d(nn.Module):
+    def __init__(self, c, eps=1e-6):
+        super().__init__()
+        self.weight, self.bias, self.eps, self.c = nn.Parameter(torch.ones(c)), nn.Parameter(torch.zeros(c)), eps, c
+
+    def forward(self, x):
+        return F.layer_norm(x.permute(0, 2, 3, 1), (self.c,), self.weight, self.bias, self.eps).permute(0, 3, 1, 2)
+
+
+class SimpleFeaturePyramid(nn.Module):
+    def __init__(self, in_dim, out_dim, strides, patch):
+        super().__init__()
+        self.levels = nn.ModuleList()
+        for s in strides:
+            f = patch / s
+            if f == 4:
+                layers, d = [nn.ConvTranspose2d(in_dim, in_dim // 2, 2, 2), LayerNorm2d(in_dim // 2), nn.GELU(),
+                             nn.ConvTranspose2d(in_dim // 2, in_dim // 4, 2, 2)], in_dim // 4
+            elif f == 2:
+                layers, d = [nn.ConvTranspose2d(in_dim, in_dim // 2, 2, 2)], in_dim // 2
+            elif f == 1:
+                layers, d = [], in_dim
+            elif f == 0.5:
+                layers, d = [nn.MaxPool2d(2, 2)], in_dim
+            else:
+                raise ValueError(f"unsupported stride {s} for patch size {patch}")
+            layers += [nn.Conv2d(d, out_dim, 1, bias=False), LayerNorm2d(out_dim),
+                       nn.Conv2d(out_dim, out_dim, 3, padding=1, bias=False), LayerNorm2d(out_dim)]
+            self.levels.append(nn.Sequential(*layers))
+
+    def forward(self, x):
+        out = OrderedDict((str(i), lvl(x)) for i, lvl in enumerate(self.levels))
+        out["pool"] = F.max_pool2d(list(out.values())[-1], 1, 2, 0)
+        return out
+
+
+class ViTDetBackbone(nn.Module):
+    def __init__(self, vit_name, strides, pretrained=True, drop_path=0.1, out_channels=256):
+        super().__init__()
+        self.vit = timm.create_model(vit_name, pretrained=pretrained, num_classes=0, global_pool="",
+                                     dynamic_img_size=True, drop_path_rate=drop_path)
+        cfg = self.vit.pretrained_cfg
+        self.mean, self.std = list(cfg.get("mean", (0.5,) * 3)), list(cfg.get("std", (0.5,) * 3))
+        self.patch = self.vit.patch_embed.patch_size[0]
+        self.neck = SimpleFeaturePyramid(self.vit.embed_dim, out_channels, strides, self.patch)
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+        # Mixed precision only for the transformer + pyramid; RPN, RoI head and losses stay in fp32 (exact box coordinates).
+        with torch.autocast(x.device.type, dtype=torch.float16, enabled=USE_AMP and x.is_cuda):
+            tokens = self.vit.forward_features(x)[:, self.vit.num_prefix_tokens:]
+            feats = self.neck(tokens.transpose(1, 2).reshape(B, -1, H // self.patch, W // self.patch))
+        return OrderedDict((k, v.float()) for k, v in feats.items())
+
+
+def build_detector(cfg, pretrained=True):
+    backbone = ViTDetBackbone(cfg["vit"], cfg["strides"], pretrained, cfg["drop_path"])
+    levels = list(cfg["strides"]) + [cfg["strides"][-1] * 2]
+    sizes = tuple(tuple(int(round(k * s)) for k in cfg["anchor_k"]) for s in levels)
+    anchors = AnchorGenerator(sizes, (tuple(cfg["anchor_ratios"]),) * len(levels))
+    roi_pool = MultiScaleRoIAlign([str(i) for i in range(len(cfg["strides"]))], output_size=7, sampling_ratio=2)
+    H, W = cfg["canvas"]
+    return FasterRCNN(
+        backbone, num_classes=3, min_size=H, max_size=W, image_mean=backbone.mean, image_std=backbone.std,
+        rpn_anchor_generator=anchors, box_roi_pool=roi_pool,
+        rpn_pre_nms_top_n_train=1000, rpn_post_nms_top_n_train=1000, rpn_pre_nms_top_n_test=1000, rpn_post_nms_top_n_test=500,
+        box_score_thresh=0.001, box_nms_thresh=0.5, box_detections_per_img=100, box_batch_size_per_image=256)
+
+
+def count_params(m):
+    return sum(p.numel() for p in m.parameters()) / 1e6
+
+
+_m = build_detector(BASE_CFG, pretrained=False)
+print(f"baseline detector: {count_params(_m):.1f}M parameters (backbone ViT {count_params(_m.backbone.vit):.1f}M)")
+del _m
+
+
+# ----------------------------------------------------------------------------
+# ## 5. Training and validation machinery
+# - **Optimiser:** AdamW, weight decay 0.05 (not applied to norms/biases/position embeddings), **layer-wise LR decay** (earlier ViT blocks change more slowly than the neck/heads), gradient clipping.
+# - **Schedule:** linear warm-up then cosine decay, stepped every iteration.
+# - **Mixed precision:** fp16 autocast for the ViT + pyramid (the expensive part) with GradScaler; RPN / RoI head / losses run in fp32 (T4 has no bf16).
+# - **EMA weights** are the ones validated and saved.
+# - **Model selection:** best validation mAP@0.50, with early stopping.
+# ----------------------------------------------------------------------------
+
+# [code block 9]
+class ModelEMA:
+    def __init__(self, model, decay):
+        self.ema, self.decay, self.updates = copy.deepcopy(model).eval(), decay, 0
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        d = self.decay * (1 - math.exp(-self.updates / 1000))
+        for e, m in zip(self.ema.state_dict().values(), model.state_dict().values()):
+            if e.dtype.is_floating_point:
+                e.mul_(d).add_(m.detach(), alpha=1 - d)
+            else:
+                e.copy_(m)
+
+
+def build_param_groups(model, lr, weight_decay, layer_decay):
+    n_blocks = len(model.backbone.vit.blocks)
+    groups = {}
+    for name, p in model.named_parameters():
+        layer = n_blocks + 1
+        if name.startswith("backbone.vit."):
+            sub = name[len("backbone.vit."):]
+            if sub.startswith("blocks."):
+                layer = int(sub.split(".")[1]) + 1
+            elif sub.startswith(("cls_token", "pos_embed", "patch_embed", "reg_token")):
+                layer = 0
+        no_decay = p.ndim <= 1 or name.endswith(("cls_token", "pos_embed"))
+        g = groups.setdefault((layer, no_decay), dict(params=[], lr=lr * layer_decay ** (n_blocks + 1 - layer),
+                                                      weight_decay=0.0 if no_decay else weight_decay))
+        g["params"].append(p)
+    return list(groups.values())
+
+
+def apply_freezing(model, n_blocks):
+    if not n_blocks:
+        return
+    vit = model.backbone.vit
+    for mod in [vit.patch_embed, *vit.blocks[:n_blocks]]:
+        for p in mod.parameters():
+            p.requires_grad_(False)
+    for name in ("cls_token", "pos_embed"):
+        if getattr(vit, name, None) is not None:
+            getattr(vit, name).requires_grad_(False)
+
+
+def cosine_with_warmup(warmup, total, floor=0.01):
+    def f(step):
+        if step < warmup:
+            return (step + 1) / warmup
+        t = min(1.0, (step - warmup) / max(1, total - warmup))
+        return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * t))
+    return f
+
+
+def train_one_epoch(model, ema, loader, opt, sched, scaler, epoch, epochs):
+    model.train()
+    sums, n = defaultdict(float), 0
+    bar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False)
+    for imgs, targets, _ in bar:
+        imgs = [i.to(DEVICE, non_blocking=True) for i in imgs]
+        targets = [{k: v.to(DEVICE) for k, v in t.items()} for t in targets]
+        losses = model(imgs, targets)
+        loss = sum(losses.values())
+        if not torch.isfinite(loss):
+            opt.zero_grad(set_to_none=True); continue
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(opt); scaler.update(); sched.step(); ema.update(model)
+        for k, v in losses.items():
+            sums[k] += v.item()
+        n += 1
+        bar.set_postfix(loss=f"{sum(sums.values()) / n:.3f}")
+    return {k: v / max(n, 1) for k, v in sums.items()}
+
+
+@torch.no_grad()
+def predict(model, loader):
+    """Returns {record index: (boxes xyxy in original pixels, scores, labels)}."""
+    model.eval()
+    out = {}
+    for imgs, _, metas in tqdm(loader, desc="predict", leave=False):
+        dets = model([i.to(DEVICE, non_blocking=True) for i in imgs])
+        for d, m in zip(dets, metas):
+            b = d["boxes"].float().cpu().numpy() / m["scale"]
+            b[:, [0, 2]] = b[:, [0, 2]].clip(0, m["size"][0])
+            b[:, [1, 3]] = b[:, [1, 3]].clip(0, m["size"][1])
+            out[m["index"]] = (b, d["scores"].float().cpu().numpy(), d["labels"].cpu().numpy())
+    return out
+
+
+# ----------------------------------------------------------------------------
+# ### Detection metrics
+# `coco_metrics` gives AP@0.50, mAP@0.50 and mAP@0.50:0.95 (pycocotools). `prf_curves` matches detections to ground truth greedily by confidence at IoU 0.5 (each ground-truth box can be matched once, class must agree) and derives precision / recall / F1 as a function of the confidence threshold.
+# ----------------------------------------------------------------------------
+
+# [code block 10]
+def coco_metrics(records, preds):
+    images = [dict(id=i, width=r["w"], height=r["h"]) for i, r in enumerate(records)]
+    anns, aid = [], 1
+    for i, r in enumerate(records):
+        for b, l in zip(r["boxes"], r["labels"]):
+            w, h = float(b[2] - b[0]), float(b[3] - b[1])
+            anns.append(dict(id=aid, image_id=i, category_id=int(l), bbox=[float(b[0]), float(b[1]), w, h], area=w * h, iscrowd=0)); aid += 1
+    dets = [dict(image_id=i, category_id=int(l), bbox=[float(b[0]), float(b[1]), float(b[2] - b[0]), float(b[3] - b[1])], score=float(s))
+            for i, (bb, ss, ll) in preds.items() for b, s, l in zip(bb, ss, ll)]
+    zero = dict(mAP50=0.0, mAP50_95=0.0, AP50={n: 0.0 for n in CLASS_NAMES.values()}, AP50_95={n: 0.0 for n in CLASS_NAMES.values()})
+    if not dets:
+        return zero
+    gt = COCO()
+    gt.dataset = dict(images=images, annotations=anns, categories=[dict(id=c, name=n) for c, n in CLASS_NAMES.items()])
+    with contextlib.redirect_stdout(io.StringIO()):
+        gt.createIndex()
+        ev = COCOeval(gt, gt.loadRes(dets), "bbox")
+        ev.evaluate(); ev.accumulate()
+    prec = ev.eval["precision"]                       # [IoU, recall, class, area, maxDets]
+
+    def mean_valid(x):
+        x = x[x > -1]
+        return float(x.mean()) if x.size else 0.0
+    ap50 = {n: mean_valid(prec[0, :, k, 0, 2]) for k, n in enumerate(CLASS_NAMES.values())}
+    ap5095 = {n: mean_valid(prec[:, :, k, 0, 2]) for k, n in enumerate(CLASS_NAMES.values())}
+    return dict(mAP50=float(np.mean(list(ap50.values()))), mAP50_95=float(np.mean(list(ap5095.values()))), AP50=ap50, AP50_95=ap5095)
+
+
+def match_image(gt_boxes, gt_labels, boxes, scores, labels, iou_thr=0.5):
+    """Greedy COCO-style matching (highest score first, same class, best unmatched IoU >= thr)."""
+    order = np.argsort(-scores)
+    boxes, scores, labels = boxes[order], scores[order], labels[order]
+    nd, ng = len(boxes), len(gt_boxes)
+    iou = box_iou(torch.from_numpy(boxes).float(), torch.from_numpy(gt_boxes).float()).numpy() if nd and ng else np.zeros((nd, ng))
+    used, tp = np.zeros(ng, bool), np.zeros(nd, bool)
+    for d in range(nd):
+        cand = np.where((gt_labels == labels[d]) & ~used & (iou[d] >= iou_thr))[0]
+        if len(cand):
+            g = cand[np.argmax(iou[d, cand])]
+            used[g], tp[d] = True, True
+    return dict(boxes=boxes, scores=scores, labels=labels, iou=iou, tp=tp, gt_used=used)
+
+
+THRESHOLDS = np.linspace(0.05, 0.95, 91)
+
+
+def prf_curves(records, preds, iou_thr=0.5, floor=0.05):
+    per = {c: dict(scores=[], tp=[], n_gt=0) for c in CLASS_NAMES}
+    for i, r in enumerate(records):
+        b, s, l = preds[i]
+        keep = s >= floor
+        m = match_image(r["boxes"], r["labels"], b[keep], s[keep], l[keep], iou_thr)
+        for c in CLASS_NAMES:
+            sel = m["labels"] == c
+            per[c]["scores"].append(m["scores"][sel]); per[c]["tp"].append(m["tp"][sel]); per[c]["n_gt"] += int((r["labels"] == c).sum())
+    curves = {}
+    for c, d in per.items():
+        sc, tp = np.concatenate(d["scores"]), np.concatenate(d["tp"])
+        P, R = [], []
+        for t in THRESHOLDS:
+            k = sc >= t
+            n_tp, n_fp = int((tp & k).sum()), int((~tp & k).sum())
+            P.append(n_tp / (n_tp + n_fp) if n_tp + n_fp else 1.0); R.append(n_tp / max(d["n_gt"], 1))
+        P, R = np.array(P), np.array(R)
+        curves[CLASS_NAMES[c]] = dict(P=P, R=R, F1=2 * P * R / np.maximum(P + R, 1e-9))
+    return curves
+
+
+def best_threshold(curves):
+    mean_f1 = np.mean([c["F1"] for c in curves.values()], axis=0)
+    return float(THRESHOLDS[int(np.argmax(mean_f1))])
+
+
+def prf_at(curves, thr):
+    k = int(np.argmin(np.abs(THRESHOLDS - thr)))
+    out = {n: dict(P=c["P"][k], R=c["R"][k], F1=c["F1"][k]) for n, c in curves.items()}
+    out["overall"] = {m: float(np.mean([out[n][m] for n in CLASS_NAMES.values()])) for m in ("P", "R", "F1")}
+    return out
+
+
+def evaluate(model, records, canvas_hw, nms_thr=None):
+    if nms_thr is not None:
+        model.roi_heads.nms_thresh = nms_thr
+    preds = predict(model, make_eval_loader(records, canvas_hw))
+    return preds, coco_metrics(records, preds)
+
+
+# ----------------------------------------------------------------------------
+# ### Training loop
+# ----------------------------------------------------------------------------
+
+# [code block 11]
+def run_training(cfg, train_recs, val_recs, epochs, tag, patience=None, save_best=None, resume=False, max_hours=None):
+    seed_everything(SEED)
+    pos = [i for i, r in enumerate(train_recs) if len(r["labels"])]
+    neg = [i for i, r in enumerate(train_recs) if not len(r["labels"])]
+    sampler = EpochSampler(pos, neg, cfg["neg_frac"], SEED)
+    loader = DataLoader(FireDataset(train_recs, cfg["canvas"], train=True), batch_size=BATCH_SIZE, sampler=sampler,
+                        num_workers=NUM_WORKERS, collate_fn=collate, drop_last=True, pin_memory=USE_AMP,
+                        persistent_workers=NUM_WORKERS > 0)
+    model = build_detector(cfg).to(DEVICE)
+    apply_freezing(model, cfg["freeze_blocks"])
+    ema = ModelEMA(model, cfg["ema_decay"])
+    opt = torch.optim.AdamW(build_param_groups(model, cfg["lr"], cfg["weight_decay"], cfg["layer_decay"]), betas=(0.9, 0.999))
+    total = epochs * (len(sampler) // BATCH_SIZE)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, cosine_with_warmup(min(cfg["warmup_iters"], total // 10), total))
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+    history, best, bad, start = [], -1.0, 0, 0
+    s = torch.load(LAST_PATH, map_location=DEVICE, weights_only=False) if resume and LAST_PATH.exists() else None
+    if s is not None and s["cfg"] == cfg and s["epochs"] == epochs:
+        model.load_state_dict(s["model"]); ema.ema.load_state_dict(s["ema"]); ema.updates = s["ema_updates"]
+        opt.load_state_dict(s["opt"]); sched.load_state_dict(s["sched"]); scaler.load_state_dict(s["scaler"])
+        history, best, bad, start = s["history"], s["best"], s["bad"], s["epoch"] + 1
+        print(f"[{tag}] resumed from epoch {start}")
+    t0 = time.time()
+    for epoch in range(start, epochs):
+        sampler.set_epoch(epoch)
+        te = time.time()
+        losses = train_one_epoch(model, ema, loader, opt, sched, scaler, epoch, epochs)
+        _, m = evaluate(ema.ema, val_recs, cfg["canvas"])
+        row = dict(epoch=epoch + 1, train_loss=sum(losses.values()), **{f"loss_{k.replace('loss_', '')}": v for k, v in losses.items()},
+                   val_mAP50=100 * m["mAP50"], val_mAP50_95=100 * m["mAP50_95"],
+                   val_AP50_smoke=100 * m["AP50"]["smoke"], val_AP50_fire=100 * m["AP50"]["fire"], epoch_min=(time.time() - te) / 60)
+        history.append(row)
+        improved = m["mAP50"] > best
+        if improved:
+            best, bad = m["mAP50"], 0
+            if save_best:
+                torch.save(dict(model=ema.ema.state_dict(), cfg=cfg, epoch=epoch + 1, val_mAP50=100 * best), save_best)
+        else:
+            bad += 1
+        print(f"[{tag}] epoch {epoch + 1:2d}/{epochs} | loss {row['train_loss']:.3f} | val mAP50 {row['val_mAP50']:.2f} | "
+              f"mAP50-95 {row['val_mAP50_95']:.2f} | smoke {row['val_AP50_smoke']:.1f} fire {row['val_AP50_fire']:.1f} | "
+              f"{row['epoch_min']:.1f} min {'*' if improved else ''}")
+        if resume:
+            torch.save(dict(model=model.state_dict(), ema=ema.ema.state_dict(), ema_updates=ema.updates, opt=opt.state_dict(),
+                            sched=sched.state_dict(), scaler=scaler.state_dict(), history=history, best=best, bad=bad, epoch=epoch, cfg=cfg, epochs=epochs), LAST_PATH)
+        if patience and bad >= patience:
+            print(f"[{tag}] early stopping (no improvement for {patience} epochs)"); break
+        if max_hours and (time.time() - t0) / 3600 > max_hours:
+            print(f"[{tag}] time budget reached, stopping"); break
+    hist = pd.DataFrame(history)
+    best_epoch = int(hist.val_mAP50.idxmax()) if len(hist) else 0
+    result = dict(tag=tag, best_val_mAP50=100 * best, best_val_mAP50_95=float(hist.val_mAP50_95.iloc[best_epoch]),
+                  minutes=(time.time() - t0) / 60, history=hist)
+    del model, ema, opt, loader
+    gc.collect()
+    if USE_AMP:
+        torch.cuda.empty_cache()
+    return result
+
+
+# ----------------------------------------------------------------------------
+# ## 6. Model selection
+# ### Stage A - architecture, resolution and fine-tuning strategy
+# Each candidate is trained for a few epochs on the same class-balanced-by-sampling subset and scored on the same validation subset. This is a *relative* comparison (short runs), used only to choose the configuration for the full training.
+# - **ViT-S vs ViT-B:** capacity vs speed/memory on a T4.
+# - **832x480 vs 640x384:** fire boxes are small, so input resolution may matter.
+# - **Stride-4 pyramid level:** finer features for small fire regions, at extra cost.
+# - **Frozen early blocks:** cheaper and less prone to overfitting, but less adaptable.
+# ----------------------------------------------------------------------------
+
+# [code block 12]
+SEL_TRAIN = subset(TRAIN_RECS, RUN["sel_train"], seed=1)
+SEL_VAL = subset(VAL_RECS, RUN["sel_val"], seed=2)
+print(f"selection subsets: {len(SEL_TRAIN)} train / {len(SEL_VAL)} val images, {RUN['sel_epochs']} epochs each")
+
+stage_a = []
+for name, override in ARCH_CANDIDATES.items():
+    r = run_training({**BASE_CFG, **override}, SEL_TRAIN, SEL_VAL, RUN["sel_epochs"], tag=name)
+    stage_a.append(dict(config=name, val_mAP50=r["best_val_mAP50"], val_mAP50_95=r["best_val_mAP50_95"], minutes=r["minutes"]))
+stage_a = pd.DataFrame(stage_a).sort_values("val_mAP50", ascending=False).reset_index(drop=True)
+print(); print(stage_a.round(2).to_string(index=False))
+BEST_ARCH = stage_a.config.iloc[0]
+print("\nselected architecture:", BEST_ARCH)
+
+
+# ----------------------------------------------------------------------------
+# ### Stage B - training-recipe variants on the selected architecture
+# - **Learning rate 2e-4** vs 1e-4 (layer decay keeps the pretrained ViT layers much lower).
+# - **Negatives:** using all empty images every epoch vs a re-sampled 50% (more hard negatives per epoch vs faster epochs).
+# ----------------------------------------------------------------------------
+
+# [code block 13]
+arch_cfg = {**BASE_CFG, **ARCH_CANDIDATES[BEST_ARCH]}
+stage_b = [dict(config="baseline recipe", val_mAP50=float(stage_a.val_mAP50.iloc[0]), val_mAP50_95=float(stage_a.val_mAP50_95.iloc[0]),
+                minutes=float(stage_a.minutes.iloc[0]), override={})]
+for name, override in RECIPE_VARIANTS.items():
+    r = run_training({**arch_cfg, **override}, SEL_TRAIN, SEL_VAL, RUN["sel_epochs"], tag=name)
+    stage_b.append(dict(config=name, val_mAP50=r["best_val_mAP50"], val_mAP50_95=r["best_val_mAP50_95"], minutes=r["minutes"], override=override))
+stage_b = pd.DataFrame(stage_b).sort_values("val_mAP50", ascending=False).reset_index(drop=True)
+print(stage_b.drop(columns="override").round(2).to_string(index=False))
+FINAL_CFG = {**arch_cfg, **stage_b.override.iloc[0]}
+print("\nfinal configuration:", {k: FINAL_CFG[k] for k in ("vit", "canvas", "strides", "lr", "layer_decay", "neg_frac", "freeze_blocks", "anchor_k", "anchor_ratios")})
+
+
+# ----------------------------------------------------------------------------
+# ## 7. Final training
+# The selected configuration is trained on the full training set with a cosine schedule, EMA weights, best-checkpoint saving on validation mAP@0.50 and early stopping. Progress is checkpointed every epoch (`last_checkpoint.pth`), so an interrupted Kaggle session can be resumed by re-running this cell.
+# ----------------------------------------------------------------------------
+
+# [code block 14]
+final = run_training(FINAL_CFG, TRAIN_RECS, VAL_RECS, RUN["final_epochs"], tag="final", patience=RUN["patience"],
+                     save_best=CKPT_PATH, resume=True, max_hours=MAX_HOURS)
+hist = final["history"]
+fig, ax = plt.subplots(1, 3, figsize=(15, 3.6))
+ax[0].plot(hist.epoch, hist.train_loss, marker="o"); ax[0].set_title("Training loss")
+ax[1].plot(hist.epoch, hist.val_mAP50, marker="o", label="mAP@0.50"); ax[1].plot(hist.epoch, hist.val_mAP50_95, marker="o", label="mAP@0.50:0.95")
+ax[1].axhline(TARGET_MAP50, color="gray", ls=":", label="90% target"); ax[1].legend(); ax[1].set_title("Validation mAP (%)")
+ax[2].plot(hist.epoch, hist.val_AP50_smoke, marker="o", color=COLORS[1], label="smoke"); ax[2].plot(hist.epoch, hist.val_AP50_fire, marker="o", color=COLORS[2], label="fire")
+ax[2].legend(); ax[2].set_title("Validation AP@0.50 per class (%)")
+for a in ax:
+    a.set_xlabel("epoch")
+plt.tight_layout(); plt.savefig(OUT_DIR / "training_curves.png", bbox_inches="tight"); plt.show()
+print(f"best validation mAP@0.50 = {final['best_val_mAP50']:.2f}% | training time {final['minutes']:.0f} min")
+
+
+# ----------------------------------------------------------------------------
+# ## 8. Evaluation
+# ### 8.1 Post-training tuning on the validation set (never on test)
+# The trained detector has two inference settings that are tuned on **validation** data only:
+# - **NMS IoU threshold** (how aggressively overlapping boxes are merged) - chosen by validation mAP@0.50.
+# - **Confidence threshold** - the value that maximises the mean per-class F1 at IoU 0.5.
+# ----------------------------------------------------------------------------
+
+# [code block 15]
+CKPT = torch.load(CKPT_PATH, map_location=DEVICE, weights_only=False)
+MODEL = build_detector(CKPT["cfg"], pretrained=False).to(DEVICE)
+MODEL.load_state_dict(CKPT["model"])
+CANVAS = CKPT["cfg"]["canvas"]
+print(f"loaded best checkpoint (epoch {CKPT['epoch']}, val mAP50 {CKPT['val_mAP50']:.2f}%)")
+
+nms_rows, val_cache = [], {}
+for nms in (0.4, 0.5, 0.6):
+    p, m = evaluate(MODEL, VAL_RECS, CANVAS, nms_thr=nms)
+    val_cache[nms] = p
+    nms_rows.append(dict(nms_iou=nms, val_mAP50=100 * m["mAP50"], val_mAP50_95=100 * m["mAP50_95"]))
+nms_df = pd.DataFrame(nms_rows)
+BEST_NMS = float(nms_df.sort_values("val_mAP50", ascending=False).nms_iou.iloc[0])
+MODEL.roi_heads.nms_thresh = BEST_NMS
+print(nms_df.round(2).to_string(index=False)); print("selected NMS IoU:", BEST_NMS)
+
+val_curves = prf_curves(VAL_RECS, val_cache[BEST_NMS])
+CONF_THR = best_threshold(val_curves)
+print(f"selected confidence threshold (max mean F1 on validation): {CONF_THR:.2f}")
+
+
+# ----------------------------------------------------------------------------
+# ### 8.2 Final test evaluation
+# ----------------------------------------------------------------------------
+
+# [code block 16]
+test_preds, test_m = evaluate(MODEL, TEST_RECS, CANVAS, nms_thr=BEST_NMS)
+test_curves = prf_curves(TEST_RECS, test_preds)
+test_prf = prf_at(test_curves, CONF_THR)
+
+rows = []
+for n in CLASS_NAMES.values():
+    rows.append(dict(scope=n.upper(), Precision=100 * test_prf[n]["P"], Recall=100 * test_prf[n]["R"], F1=100 * test_prf[n]["F1"],
+                     **{"AP@0.50": 100 * test_m["AP50"][n], "AP@0.50:0.95": 100 * test_m["AP50_95"][n]}))
+rows.append(dict(scope="OVERALL", Precision=100 * test_prf["overall"]["P"], Recall=100 * test_prf["overall"]["R"], F1=100 * test_prf["overall"]["F1"],
+                 **{"AP@0.50": 100 * test_m["mAP50"], "AP@0.50:0.95": 100 * test_m["mAP50_95"]}))
+test_table = pd.DataFrame(rows).set_index("scope").round(2)
+test_table = test_table.rename(index={"OVERALL": "OVERALL (mAP)"})
+print(f"TEST SET ({len(TEST_RECS)} images) | confidence threshold {CONF_THR:.2f}, NMS IoU {BEST_NMS}, IoU match 0.50")
+print(test_table.to_string())
+print(f"\nmAP@0.50 = {100 * test_m['mAP50']:.2f}%   (target {TARGET_MAP50:.0f}%: gap {100 * test_m['mAP50'] - TARGET_MAP50:+.2f} points)")
+
+fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+for n, c in zip(CLASS_NAMES.values(), (COLORS[1], COLORS[2])):
+    ax[0].plot(test_curves[n]["R"], test_curves[n]["P"], color=c, label=n)
+    ax[1].plot(THRESHOLDS, test_curves[n]["F1"], color=c, label=n)
+ax[0].set(xlabel="recall", ylabel="precision", title="Precision-recall (IoU 0.5, test)", xlim=(0, 1), ylim=(0, 1.02)); ax[0].legend()
+ax[1].axvline(CONF_THR, color="gray", ls=":", label=f"chosen threshold {CONF_THR:.2f}")
+ax[1].set(xlabel="confidence threshold", ylabel="F1", title="F1 vs confidence (test)", ylim=(0, 1)); ax[1].legend()
+plt.tight_layout(); plt.savefig(OUT_DIR / "test_pr_f1_curves.png", bbox_inches="tight"); plt.show()
+
+
+# ----------------------------------------------------------------------------
+# ## 9. Error analysis
+# Every test prediction above the chosen confidence threshold is matched to ground truth (IoU 0.5) and each error is categorised:
+# - **False positives:** *duplicate* (a second box on an already-detected object), *wrong class* (right place, wrong label), *poor localisation* (right class, IoU 0.1-0.5), *background* (nothing there).
+# - **False negatives:** *missed* (no detection) or *class confusion* (detected, but with the other label).
+# - Recall is also broken down by object size using the data-driven size buckets.
+# ----------------------------------------------------------------------------
+
+# [code block 17]
+def analyse_errors(records, preds, conf, iou_thr=0.5):
+    img_rows, gt_rows, fp_rows = [], [], []
+    for i, r in enumerate(records):
+        b, s, l = preds[i]
+        k = s >= conf
+        m = match_image(r["boxes"], r["labels"], b[k], s[k], l[k], iou_thr)
+        n_fp, top_fp = 0, 0.0
+        for d in np.where(~m["tp"])[0]:
+            iou = m["iou"][d] if len(r["boxes"]) else np.zeros(0)
+            same, other = iou[r["labels"] == m["labels"][d]], iou[r["labels"] != m["labels"][d]]
+            if same.size and same.max() >= iou_thr:
+                kind = "duplicate"
+            elif other.size and other.max() >= iou_thr:
+                kind = "wrong class"
+            elif same.size and same.max() >= 0.1:
+                kind = "poor localisation"
+            else:
+                kind = "background"
+            fp_rows.append(dict(image=i, kind=kind, cls=CLASS_NAMES[int(m["labels"][d])], score=float(m["scores"][d])))
+            n_fp += 1; top_fp = max(top_fp, float(m["scores"][d]))
+        n_fn = 0
+        for g in range(len(r["boxes"])):
+            confused = bool(len(m["boxes"]) and ((m["labels"] != r["labels"][g]) & (m["iou"][:, g] >= iou_thr)).any())
+            area = (r["boxes"][g][2] - r["boxes"][g][0]) * (r["boxes"][g][3] - r["boxes"][g][1]) / (r["w"] * r["h"])
+            found = bool(m["gt_used"][g])
+            gt_rows.append(dict(image=i, cls=CLASS_NAMES[int(r["labels"][g])], area=area, found=found,
+                                miss_kind=None if found else ("class confusion" if confused else "missed")))
+            n_fn += not found
+        img_rows.append(dict(index=i, n_gt=len(r["boxes"]), n_pred=len(m["boxes"]), n_fp=n_fp, n_fn=n_fn, top_fp=top_fp))
+    return pd.DataFrame(img_rows), pd.DataFrame(gt_rows), pd.DataFrame(fp_rows)
+
+
+img_df, gt_df, fp_df = analyse_errors(TEST_RECS, test_preds, CONF_THR)
+gt_df["size"] = pd.cut(gt_df.area, [0, SIZE_EDGES[0], SIZE_EDGES[1], 1.01], labels=["small", "medium", "large"])
+
+print("False positives by type and class:")
+print((fp_df.groupby(["kind", "cls"]).size().unstack(fill_value=0) if len(fp_df) else pd.DataFrame()).to_string())
+print("\nMissed ground-truth boxes:")
+print(gt_df[~gt_df.found].groupby(["miss_kind", "cls"]).size().unstack(fill_value=0).to_string() if (~gt_df.found).any() else "none")
+print("\nRecall (%) by object size and class:")
+print((100 * gt_df.pivot_table(index="size", columns="cls", values="found", aggfunc="mean", observed=False)).round(1).to_string())
+neg_imgs = img_df[img_df.n_gt == 0]
+print(f"\nNegative images: {len(neg_imgs)} | with at least one false alarm: {(neg_imgs.n_fp > 0).sum()} ({100 * (neg_imgs.n_fp > 0).mean():.1f}%)")
+
+fig, ax = plt.subplots(1, 2, figsize=(11, 3.4))
+if len(fp_df):
+    fp_df.groupby(["kind", "cls"]).size().unstack(fill_value=0).plot.barh(ax=ax[0], color=[COLORS[2], COLORS[1]], rot=0)
+ax[0].set_title("False positives by type")
+(100 * gt_df.pivot_table(index="size", columns="cls", values="found", aggfunc="mean", observed=False)).plot.bar(ax=ax[1], color=[COLORS[2], COLORS[1]], rot=0)
+ax[1].set_title("Recall (%) by object size"); ax[1].set_ylim(0, 100)
+plt.tight_layout(); plt.savefig(OUT_DIR / "error_analysis.png", bbox_inches="tight"); plt.show()
+
+
+# ----------------------------------------------------------------------------
+# ## 10. Prediction visualisations
+# Dashed white boxes = ground truth; coloured boxes = predictions with class and confidence.
+# ----------------------------------------------------------------------------
+
+# [code block 18]
+def panels_for(idx_list, note=None):
+    out = []
+    for i in idx_list:
+        r, (b, s, l) = TEST_RECS[i], test_preds[i]
+        k = s >= CONF_THR
+        row = img_df.iloc[i]
+        out.append((read_rgb(r["img"]), [(r["boxes"], r["labels"], None, True), (b[k], l[k], s[k], False)],
+                    f"{r['name']} | GT {row.n_gt} | FP {row.n_fp} FN {row.n_fn}"))
+    return out
+
+
+rng = np.random.RandomState(SEED)
+def pick(mask, n, key=None):
+    sel = img_df[mask]
+    return sel.sort_values(key, ascending=False).index[:n].tolist() if key else rng.permutation(sel.index.to_list())[:n].tolist()
+correct = pick((img_df.n_gt > 0) & (img_df.n_fp == 0) & (img_df.n_fn == 0), 8)
+missed = pick(img_df.n_fn > 0, 8)
+false_pos = pick(img_df.n_fp > 0, 8, key="top_fp")
+img_df["errors"] = img_df.n_fp + img_df.n_fn
+difficult = pick(img_df.errors > 1, 8, key="errors")
+
+show_grid(panels_for(correct), title="Correct detections", save="vis_correct.png")
+show_grid(panels_for(missed), title="Missed detections (false negatives)", save="vis_missed.png")
+show_grid(panels_for(false_pos), title="False positives (most confident first)", save="vis_false_positives.png")
+show_grid(panels_for(difficult), title="Difficult cases (most errors)", save="vis_difficult.png")
+
+
+# ----------------------------------------------------------------------------
+# ## 11. Save the final model and inference code
+# The checkpoint stores the weights, the model configuration and the tuned NMS / confidence thresholds, so it can be loaded on its own.
+# ----------------------------------------------------------------------------
+
+# [code block 19]
+def to_py(o):
+    if isinstance(o, dict):
+        return {k: to_py(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return type(o)(to_py(v) for v in o)
+    return float(o) if isinstance(o, (np.floating,)) else o
+
+
+RESULTS = dict(
+    test_mAP50=100 * test_m["mAP50"], test_mAP50_95=100 * test_m["mAP50_95"],
+    test_AP50={k: 100 * v for k, v in test_m["AP50"].items()},
+    test_precision_recall_f1={k: {m: 100 * float(x) for m, x in v.items()} for k, v in test_prf.items()},
+    val_mAP50=CKPT["val_mAP50"], conf_threshold=CONF_THR, nms_iou=BEST_NMS, test_images=len(TEST_RECS))
+torch.save(dict(model=MODEL.state_dict(), cfg=CKPT["cfg"], epoch=CKPT["epoch"], val_mAP50=CKPT["val_mAP50"], conf_threshold=CONF_THR,
+                nms_iou=BEST_NMS, class_names=CLASS_NAMES, results=to_py(RESULTS)), CKPT_PATH)
+(OUT_DIR / "final_results.json").write_text(json.dumps(to_py(RESULTS), indent=2))
+print("saved:", CKPT_PATH, f"({CKPT_PATH.stat().st_size / 1e6:.0f} MB)")
+
+
+class FireSmokeDetector:
+    """Standalone inference: detector = FireSmokeDetector(path); detector(image) -> list of detections."""
+
+    def __init__(self, checkpoint, device=None, conf=None):
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        ck = torch.load(checkpoint, map_location=self.device, weights_only=False)
+        self.model = build_detector(ck["cfg"], pretrained=False).to(self.device).eval()
+        self.model.load_state_dict(ck["model"])
+        self.model.roi_heads.nms_thresh = ck["nms_iou"]
+        self.canvas, self.conf = ck["cfg"]["canvas"], (conf if conf is not None else ck["conf_threshold"])
+        self.names = ck["class_names"]
+
+    @torch.no_grad()
+    def __call__(self, image, conf=None):
+        """image: file path, PIL image or RGB uint8 array. Returns [{'label', 'confidence', 'box': [x1, y1, x2, y2]}, ...]."""
+        if isinstance(image, (str, Path)):
+            image = read_rgb(image)
+        image = np.asarray(image)
+        h, w = image.shape[:2]
+        img, _, scale = letterbox(image, np.zeros((0, 4), np.float32), self.canvas)
+        x = torch.from_numpy(img).permute(2, 0, 1).float().div_(255).to(self.device)
+        out = self.model([x])[0]
+        thr = self.conf if conf is None else conf
+        dets = []
+        for b, s, l in zip(out["boxes"].float().cpu().numpy() / scale, out["scores"].float().cpu().numpy(), out["labels"].cpu().numpy()):
+            if s >= thr:
+                dets.append(dict(label=self.names[int(l)], confidence=round(float(s), 4),
+                                 box=[round(float(v), 1) for v in (max(b[0], 0), max(b[1], 0), min(b[2], w), min(b[3], h))]))
+        return sorted(dets, key=lambda d: -d["confidence"])
+
+
+def show_detections(image, dets, ax=None):
+    image = read_rgb(image) if isinstance(image, (str, Path)) else np.asarray(image)
+    ax = ax or plt.subplots(figsize=(7, 4.5))[1]
+    ax.imshow(image); ax.axis("off")
+    name_to_id = {v: k for k, v in CLASS_NAMES.items()}
+    draw_boxes(ax, [d["box"] for d in dets], [name_to_id[d["label"]] for d in dets], [d["confidence"] for d in dets])
+
+
+# ----------------------------------------------------------------------------
+# ## 12. Demonstration
+# The saved checkpoint is loaded from disk into a fresh detector and run on test images. To use it on your own image: `detector("path/to/image.jpg")`.
+# ----------------------------------------------------------------------------
+
+# [code block 20]
+detector = FireSmokeDetector(CKPT_PATH)
+demo = [TEST_RECS[i] for i in rng.permutation(len(TEST_RECS))[:6]]
+fig, axes = plt.subplots(len(demo), 2, figsize=(11, 3.1 * len(demo)))
+for row, r in zip(axes, demo):
+    dets = detector(r["img"])
+    row[0].imshow(read_rgb(r["img"])); row[0].set_title("original", fontsize=9); row[0].axis("off")
+    show_detections(r["img"], dets, ax=row[1]); row[1].set_title(f"{r['name']}: " + (", ".join(f"{d['label']} {d['confidence']:.2f}" for d in dets) or "no fire / smoke detected"), fontsize=9)
+plt.tight_layout(); plt.savefig(OUT_DIR / "demo_predictions.png", bbox_inches="tight"); plt.show()
+
+example = next((r for r in demo if len(r["labels"])), demo[0])
+print("detector('%s') ->" % example["name"])
+for d in detector(example["img"]):
+    print(f"  {d['label']:5s} conf {d['confidence']:.3f}  box {d['box']}")
+
+
+# ----------------------------------------------------------------------------
+# ## 13. Final results
+# ----------------------------------------------------------------------------
+
+# [code block 21]
+print("=" * 72)
+print(f"FOREST FIRE DETECTION - ViT-based detector ({FINAL_CFG['vit'].split('.')[0]}, ViTDet-style Faster R-CNN)")
+print(f"input {FINAL_CFG['canvas'][1]}x{FINAL_CFG['canvas'][0]} | test images: {len(TEST_RECS)} | confidence {CONF_THR:.2f} | NMS IoU {BEST_NMS} | match IoU 0.50")
+print("=" * 72)
+print(test_table.to_string())
+print("-" * 72)
+print(f"mAP@0.50 (headline metric): {100 * test_m['mAP50']:.2f}%  vs target {TARGET_MAP50:.0f}%  ->  "
+      f"{'target reached' if 100 * test_m['mAP50'] >= TARGET_MAP50 else 'below target by %.2f points' % (TARGET_MAP50 - 100 * test_m['mAP50'])}")
+print(f"validation mAP@0.50 of the selected checkpoint: {CKPT['val_mAP50']:.2f}%")
+print(f"model saved to: {CKPT_PATH}")
+print("=" * 72)

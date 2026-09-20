@@ -1,0 +1,10 @@
+# dataset (3 GB) - download D-Fire separately
+data/
+# resumable training state (1.7 GB) - not needed for inference
+outputs/last_checkpoint.pth
+# scratch
+deliverables/cm_run.log
+__pycache__/
+.ipynb_checkpoints/
+# local notes (not for GitHub)
+PROJECT_NOTES.md

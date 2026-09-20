@@ -1,0 +1,4 @@
+,pred smoke,pred fire,pred background
+true smoke,1931,4,376
+true fire,12,1882,984
+true background,402,692,0

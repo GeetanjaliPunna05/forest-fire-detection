@@ -1,0 +1,40 @@
+﻿torch 2.9.1+rocm7.2.1 | torchvision 0.24.1+rocm7.2.1 | timm 1.0.29 | albumentations 2.0.8
+device: AMD Radeon RX 9070 GRE
+--- cell 2 ok (2s)  [total 0.0 min]
+--- cell 4 ok (0s)  [total 0.0 min]
+dataset root: C:\Users\NothingToSay\Desktop\Project\data
+label cleaning: {'clipped_to_image': 284, 'degenerate_box_removed': 20}
+--- cell 6 ok (5s)  [total 0.1 min]
+       images  with_objects  empty  boxes  smoke_boxes  fire_boxes  empty_%
+split                                                                      
+train   14122          7664   6458  17418         7788        9630     45.7
+val      3099          1724   1375   3930         1754        2176     44.4
+test     4306          2301   2005   5189         2311        2878     46.6
+file-name overlap  train/val: 0 | train/test: 0 | val/test: 0
+most common train resolutions: {'1280x720': np.int64(6062), '640x360': np.int64(2724), '480x360': np.int64(476), '640x352': np.int64(442), '1920x1080': np.int64(178)}
+size buckets (box area / image area): small < 0.52% <= medium < 6.09% <= large
+--- cell 8 ok (0s)  [total 0.1 min]
+--- cell 10 ok (1s)  [total 0.1 min]
+train 14122 | val 3099 | test 4306 images
+--- cell 12 ok (0s)  [total 0.1 min]
+sizes_x_stride              aspect_ratios  anchors_per_location  mean_best_IoU  box_recall_IoU50  box_recall_IoU70
+        (4, 6)            (0.5, 1.0, 2.0)                     6          0.741             0.922             0.760
+        (3, 5)            (0.5, 1.0, 2.0)                     6          0.734             0.947             0.655
+        (2, 4)            (0.5, 1.0, 2.0)                     6          0.665             0.921             0.429
+          (4,) (0.25, 0.5, 1.0, 2.0, 4.0)                     5          0.662             0.900             0.452
+          (4,)      (0.33, 0.5, 1.0, 2.0)                     4          0.661             0.896             0.441
+selected anchors -> sizes x stride: (4, 6) | aspect ratios (h/w): (0.5, 1.0, 2.0)
+--- cell 14 ok (0s)  [total 0.1 min]
+baseline detector: 39.5M parameters (backbone ViT 21.7M)
+--- cell 16 ok (0s)  [total 0.2 min]
+--- cell 18 ok (0s)  [total 0.2 min]
+--- cell 20 ok (0s)  [total 0.2 min]
+--- cell 22 ok (0s)  [total 0.2 min]
+python.exe : Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher 
+rate limits and faster downloads.
+At line:1 char:399
++ ... NG="utf-8"; & C:\fire_env\Scripts\python.exe "C:\Users\NothingToSay\A ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Warning: You ar...ster downloads.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
