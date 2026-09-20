@@ -7,6 +7,13 @@ with bounding boxes. Trained and evaluated on the D-Fire dataset
 **Headline result:** 78.07% mAP@0.50 on the test set (4,306 images). The project target was 90%, so this run is
 11.93 points short. It is a single training run with one random seed.
 
+## Quick start (no training)
+
+Training the model takes several hours (about 4.7 hours here), but you do not need to repeat it. The trained model is in the repo.
+Open **`forest_fire_inference.ipynb`** (locally, on Kaggle or on Colab): it downloads the model, shows the saved results and
+runs the detector on example images or on your own, in about a minute. To run it on a single image from the command line
+use `predict.py` (see "Using the trained model" below). `forest_fire_vit_detection.ipynb` is the full training pipeline.
+
 ## Results
 
 Test set, confidence threshold 0.82, NMS IoU 0.5, match IoU 0.5 (thresholds tuned on validation only):
@@ -73,7 +80,8 @@ These are short runs that only rank configurations; the recipe differences are w
 
 | Path | What it is |
 |---|---|
-| `forest_fire_vit_detection.ipynb` | The full pipeline: data, model, training, evaluation, error analysis |
+| `forest_fire_vit_detection.ipynb` | The full pipeline including training (several hours): data, model, training, evaluation, error analysis |
+| `forest_fire_inference.ipynb` | **Quick start:** loads the trained model, shows its results, runs it on images (no training, about 1 minute) |
 | `run_notebook.py` | Runs the notebook headlessly and logs progress per cell |
 | `predict.py` | Standalone inference: run the final model on an image (see below) |
 | `outputs/forest_fire_detection_best.pth` | Final model (Git LFS, about 424 MB): weights, config, tuned thresholds |
